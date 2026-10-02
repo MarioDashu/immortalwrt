@@ -1,0 +1,207 @@
+# ============================================================================
+#  Build ImmortalWrt with GitHub Actions
+#
+#  适用仓库：MarioDashu/immortalwrt（源码仓库本体，master 分支，已自带 .config）
+#  放置路径：.github/workflows/build-immortalwrt.yml
+#
+#  特点：
+#    - 直接 checkout 本仓库源码，不再去 clone 别处
+#    - 使用仓库根目录已有的 .config（你 10-02 提交的那个）
+#    - 依赖按 ImmortalWrt 官方清单安装，并针对 ubuntu-22.04 做了包名兼容
+#    - 缓存 toolchain + ccache，二次编译大幅提速
+#    - 可选 SSH 交互式 menuconfig、容错编译、发布到 Release
+# ============================================================================
+name: Build ImmortalWrt
+
+on:
+  workflow_dispatch:
+    inputs:
+      ssh:
+        description: '开启 SSH 调试（可进 runner 跑 make menuconfig）'
+        required: false
+        default: 'false'
+      ignore_errors:
+        description: '容错编译：跳过编译失败的单个包（插件多时建议开启）'
+        required: false
+        default: 'false'
+      upload_release:
+        description: '发布到 GitHub Release（需先开启 Actions 写权限）'
+        required: false
+        default: 'false'
+  # 每天北京时间 10:00 自动编译一次（UTC 02:00），不需要就注释掉
+  # schedule:
+  #   - cron: '0 2 * * *'
+  # 推送即触发（.config 一改就自动编），不需要就注释掉
+  # push:
+  #   paths: [ '.config', 'feeds.conf.default', '.github/workflows/**' ]
+
+env:
+  TZ: Asia/Shanghai
+  # 缓存区分键：架构/分支变了就改这里，避免缓存串味
+  CACHE_MIXKEY: immortalwrt-master
+
+jobs:
+  build:
+    # 固定 22.04：ubuntu-latest 已是 24.04，Python 3.12 移除了 distutils，
+    # 会直接卡在依赖检查；ImmortalWrt 官方也推荐 Debian 11 系
+    runs-on: ubuntu-22.04
+    timeout-minutes: 350          # GitHub 硬上限 360 分钟，留 10 分钟余量
+
+    steps:
+
+    # ------------------------------------------------------------- 1. 检出源码
+    - name: Checkout
+      uses: actions/checkout@v4
+      with:
+        fetch-depth: 0            # 缓存 action 靠 commit id 判断缓存是否有效
+
+    # ------------------------------------------------------- 2. 安装编译依赖
+    - name: 初始化编译环境
+      env:
+        DEBIAN_FRONTEND: noninteractive
+      run: |
+        # 2.1 腾磁盘：runner 约 84G，先干掉不用的大件
+        sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc \
+                    /opt/hostedtoolcache/CodeQL /usr/share/swift /usr/lib/jvm
+        sudo docker image prune --all --force 2>/dev/null || true
+        sudo swapoff -a || true
+        df -hT /
+
+        sudo -E apt-get update -qq
+
+        # 2.2 核心依赖（缺一个就编不动，装不上直接失败好过编译到一半报错）
+        sudo -E apt-get install -y --no-install-recommends \
+          build-essential clang flex bison gawk gcc-multilib g++-multilib \
+          gettext git libncurses-dev libssl-dev zlib1g-dev \
+          python3 python3-distutils python3-setuptools python3-dev \
+          python3-pyelftools python3-ply python3-docutils python3-pip \
+          rsync swig unzip file wget ccache curl patch pkgconf
+
+        # 2.3 扩展依赖（逐个装，个别包名在新系统上不存在就跳过，不影响整体）
+        #     注：libgmp3-dev → libgmp-dev，mkisofs → genisoimage 是 Ubuntu 22.04 的改名
+        for p in ack asciidoc autoconf automake autopoint binutils bzip2 cmake cpio \
+                 device-tree-compiler ecj fastjar gperf haveged help2man intltool \
+                 lib32gcc-s1 libc6-dev-i386 libelf-dev libglib2.0-dev libgmp-dev \
+                 libltdl-dev libmpc-dev libmpfr-dev libpython3-dev libreadline-dev \
+                 libtool libyaml-dev lld llvm lrzsz genisoimage msmtp nano ninja-build \
+                 p7zip p7zip-full qemu-utils re2c scons squashfs-tools subversion \
+                 texinfo uglifyjs upx-ucl vim xmlto xxd zstd gnutls-dev; do
+          sudo -E apt-get install -y --no-install-recommends "$p" \
+            >/dev/null 2>&1 || echo "跳过（本系统无此包）: $p"
+        done
+
+        sudo -E apt-get autoremove --purge -y || true
+        sudo -E apt-get clean
+        sudo timedatectl set-timezone "$TZ"
+        echo "--- 环境自检 ---"
+        gcc --version | head -1; python3 --version
+        df -hT /
+
+    # ------------------------------------------------------------- 3. 更新 feeds
+    - name: 查看并使用 feeds 配置
+      run: |
+        echo "=== 仓库自带 feeds.conf.default ==="
+        cat feeds.conf.default
+        # 需要加第三方软件源，在这里追加即可，例如：
+        # echo 'src-git helloworld https://github.com/fw876/helloworld' >> feeds.conf.default
+
+    - name: 更新并安装 feeds
+      run: |
+        ./scripts/feeds update -a
+        ./scripts/feeds install -a
+
+    # ------------------------------------------------------------- 4. 加载配置
+    - name: 加载 .config
+      run: |
+        if [ -s .config ]; then
+          echo "✔ 使用仓库根目录已有的 .config"
+        else
+          echo "⚠ 未发现 .config，将使用默认配置（机型需在下一步 SSH 里用 menuconfig 改）"
+        fi
+        # 开启开发者选项与 ccache（配合后面的缓存步骤）
+        echo -e 'CONFIG_DEVEL=y\nCONFIG_CCACHE=y\nCONFIG_BUILD_LOG=y' >> .config
+        make defconfig
+        echo "=== 编译目标 ==="
+        grep -E '^CONFIG_TARGET' .config | head -20
+        echo "=== LuCI ==="
+        grep -E '^CONFIG_PACKAGE_luci(-app)?[a-z0-9-]*=' .config | head -20
+
+    # --------------------------------------------------------- 5. 自定义修改
+    # 可选：仓库根目录放一个 diy.sh（chmod +x），在这里执行，用来改默认 IP/主机名等
+    - name: 执行自定义脚本 diy.sh
+      run: |
+        if [ -f diy.sh ]; then
+          chmod +x diy.sh && ./diy.sh
+        else
+          echo "无 diy.sh，跳过自定义修改"
+        fi
+
+    # -------------------------------------------------------------- 6. SSH 入口
+    - name: SSH 连接到 Actions
+      uses: mxschmitt/action-tmate@v3
+      if: ${{ github.event.inputs.ssh == 'true' }}
+      with:
+        detached: false
+
+    # -------------------------------------------------------------- 7. 缓存加速
+    # 缓存 toolchain + ccache，第二次及以后可省 30~50 分钟
+    - name: 缓存工具链与 ccache
+      uses: stupidloud/cachewrtbuild@main
+      with:
+        ccache: 'true'
+        mixkey: ${{ env.CACHE_MIXKEY }}
+        prefix: ${{ github.workspace }}
+
+    # -------------------------------------------------------- 8. 下载软件包源码
+    - name: 下载软件包源码
+      id: package
+      run: |
+        make defconfig
+        make download -j8
+        # 删掉下载失败产生的坏包（小于 1KB），否则编译时会校验失败
+        find dl -size -1024c -exec ls -l {} \;
+        find dl -size -1024c -exec rm -f {} \;
+
+    # --------------------------------------------------------------- 9. 编译
+    - name: 编译固件
+      id: compile
+      run: |
+        echo "使用 $(nproc) 线程编译"
+        if [ "${{ github.event.inputs.ignore_errors }}" = "true" ]; then
+          make -j$(($(nproc) + 1)) IGNORE_ERRORS=1 || make -j1 IGNORE_ERRORS=1
+        else
+          make -j$(($(nproc) + 1)) || make -j1 || make -j1 V=s
+        fi
+        echo "status=success" >> $GITHUB_OUTPUT
+
+    - name: 检查磁盘占用
+      if: ${{ !cancelled() }}
+      run: df -hT
+
+    # ------------------------------------------------------------- 10. 收产物
+    - name: 整理固件
+      id: organize
+      if: ${{ steps.compile.outputs.status == 'success' }}
+      run: |
+        cd bin/targets/*/*
+        rm -rf packages
+        echo "FIRMWARE=$PWD" >> $GITHUB_ENV
+        echo "status=success" >> $GITHUB_OUTPUT
+        ls -lh
+
+    - name: 上传固件到 Artifact
+      uses: actions/upload-artifact@v4
+      if: ${{ steps.organize.outputs.status == 'success' }}
+      with:
+        name: ImmortalWrt-${{ env.CACHE_MIXKEY }}-run${{ github.run_number }}
+        path: ${{ env.FIRMWARE }}
+        retention-days: 30
+
+    - name: 发布到 Release
+      uses: softprops/action-gh-release@v2
+      if: ${{ steps.organize.outputs.status == 'success' && github.event.inputs.upload_release == 'true' }}
+      with:
+        tag_name: ${{ env.CACHE_MIXKEY }}-${{ github.run_number }}
+        files: ${{ env.FIRMWARE }}/*
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
