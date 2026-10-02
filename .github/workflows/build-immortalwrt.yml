@@ -138,8 +138,10 @@ jobs:
 
     # -------------------------------------------------------------- 6. SSH 入口
     - name: SSH 连接到 Actions
-      uses: mxschmitt/action-tmate@v3
+      uses: csexton/debugger-action@master
       if: ${{ github.event.inputs.ssh == 'true' }}
+      timeout-minutes: 30
+      continue-on-error: true
       with:
         detached: false
 
